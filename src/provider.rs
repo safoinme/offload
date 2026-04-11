@@ -264,6 +264,22 @@ pub trait Sandbox: Send {
     ///   path inside the sandbox and local is the destination path
     async fn download(&self, paths: &[(&Path, &Path)]) -> ProviderResult<()>;
 
+    /// Executes a command and fetches a single result file in one round-trip.
+    ///
+    /// Optional fast path to avoid a second provider round-trip for the
+    /// common case of streaming pytest output and then fetching junit.xml.
+    /// Implementations that cannot amortize a fused round-trip return
+    /// `Ok(None)` so the caller falls back to `exec_stream` + `download`.
+    ///
+    /// # Arguments
+    /// * `cmd` - The command to execute
+    /// * `fetch` - `(remote, local)` path pair to fetch after the command exits
+    async fn exec_and_fetch_stream(
+        &self,
+        cmd: &Command,
+        fetch: (&Path, &Path),
+    ) -> ProviderResult<Option<OutputStream>>;
+
     /// Terminates the sandbox and releases resources.
     ///
     /// After calling this method, the sandbox should not be used.

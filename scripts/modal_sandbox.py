@@ -488,17 +488,9 @@ def stream_output(source, dest):
         dest.flush()
 
 
-@cli.command("exec")
-@click.argument("sandbox_id")
-@click.argument("command")
-def exec_command(sandbox_id: str, command: str):
-    """Execute a command on an existing Modal sandbox."""
-    sandbox = modal.Sandbox.from_id(sandbox_id)
-
-    # Execute command
+def run_and_stream(sandbox, command: str) -> int:
+    """Run `bash -c command` on the sandbox, stream stdout/stderr, return exit code."""
     process = sandbox.exec("bash", "-c", command)
-
-    # Stream stdout and stderr concurrently using threads
     stdout_thread = threading.Thread(
         target=stream_output, args=(process.stdout, sys.stdout)
     )
@@ -509,9 +501,67 @@ def exec_command(sandbox_id: str, command: str):
     stderr_thread.start()
     stdout_thread.join()
     stderr_thread.join()
-
     process.wait()
-    sys.exit(process.returncode)
+    return process.returncode
+
+
+@cli.command("exec")
+@click.argument("sandbox_id")
+@click.argument("command")
+def exec_command(sandbox_id: str, command: str):
+    """Execute a command on an existing Modal sandbox."""
+    sandbox = modal.Sandbox.from_id(sandbox_id)
+    sys.exit(run_and_stream(sandbox, command))
+
+
+@cli.command("exec-and-fetch")
+@click.argument("sandbox_id")
+@click.argument("command")
+@click.option(
+    "--fetch",
+    "fetches",
+    multiple=True,
+    help=(
+        "Fetch file(s) from the sandbox after exec completes. "
+        "Format: 'remote_path:local_path'. Can be specified multiple times."
+    ),
+)
+def exec_and_fetch_command(
+    sandbox_id: str, command: str, fetches: tuple[str, ...]
+):
+    """Execute a command on an existing Modal sandbox and fetch result files.
+
+    Fetches run after exec regardless of exit code (pytest writes junit.xml
+    before exiting). Exits with exec's code on exec failure, or 2 if exec
+    succeeded but a fetch failed.
+    """
+    sandbox = modal.Sandbox.from_id(sandbox_id)
+    exec_rc = run_and_stream(sandbox, command)
+
+    fetch_failed = False
+    for spec in fetches:
+        if ":" not in spec:
+            logger.error("Invalid --fetch format '%s', expected 'remote:local'", spec)
+            fetch_failed = True
+            continue
+
+        remote_path, local_path = spec.split(":", 1)
+        if not remote_path or not local_path:
+            logger.error("Empty remote or local path in --fetch '%s'", spec)
+            fetch_failed = True
+            continue
+
+        try:
+            copy_from_sandbox(sandbox, remote_path, local_path)
+        except Exception as e:
+            logger.error("Failed to fetch %s: %s", remote_path, e)
+            fetch_failed = True
+
+    if exec_rc != 0:
+        sys.exit(exec_rc)
+    if fetch_failed:
+        sys.exit(2)
+    sys.exit(0)
 
 
 # App and function for the 'run' subcommand

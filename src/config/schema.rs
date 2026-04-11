@@ -266,6 +266,22 @@ pub struct DefaultProviderConfig {
     #[serde(default)]
     pub download_command: Option<String>,
 
+    /// Optional command that fuses exec + download into one invocation.
+    ///
+    /// When set, used instead of `exec_command` + `download_command` for
+    /// batches that produce a single result file (JUnit XML).
+    ///
+    /// Available placeholders:
+    /// - `{sandbox_id}`: The ID returned by create_command
+    /// - `{command}`: The shell-escaped test command to run
+    /// - `{fetch}`: A single "remote:local" path pair (shell-escaped) to
+    ///   fetch after the command exits
+    ///
+    /// Exit code convention: 0 on full success, exec's code on exec
+    /// failure, 2 if exec succeeded but the fetch failed.
+    #[serde(default)]
+    pub exec_and_fetch_command: Option<String>,
+
     /// Local working directory for running the lifecycle commands.
     ///
     /// Useful when commands are scripts in a specific directory.

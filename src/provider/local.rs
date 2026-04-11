@@ -159,6 +159,14 @@ impl Sandbox for LocalSandbox {
         Ok(Box::pin(combined))
     }
 
+    async fn exec_and_fetch_stream(
+        &self,
+        _cmd: &Command,
+        _fetch: (&Path, &Path),
+    ) -> ProviderResult<Option<OutputStream>> {
+        Ok(None)
+    }
+
     async fn download(&self, paths: &[(&Path, &Path)]) -> ProviderResult<()> {
         for (remote, local) in paths {
             let src = self.working_dir.join(remote);

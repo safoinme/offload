@@ -113,6 +113,13 @@ mod tests {
         ) -> ProviderResult<OutputStream> {
             unimplemented!()
         }
+        async fn exec_and_fetch_stream(
+            &self,
+            _cmd: &crate::provider::Command,
+            _fetch: (&Path, &Path),
+        ) -> ProviderResult<Option<OutputStream>> {
+            Ok(None)
+        }
         async fn download(&self, _paths: &[(&Path, &Path)]) -> ProviderResult<()> {
             unimplemented!()
         }

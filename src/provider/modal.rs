@@ -198,6 +198,10 @@ impl SandboxProvider for ModalProvider {
         let destroy_command = "uv run @modal_sandbox.py destroy {sandbox_id}".to_string();
         let download_command =
             Some("uv run @modal_sandbox.py download {sandbox_id} {paths}".to_string());
+        let exec_and_fetch_command = Some(
+            "uv run @modal_sandbox.py exec-and-fetch {sandbox_id} {command} --fetch {fetch}"
+                .to_string(),
+        );
 
         // Merge provider base env with sandbox-specific env (includes OFFLOAD_ROOT)
         let mut env = self.base_env();
@@ -209,6 +213,7 @@ impl SandboxProvider for ModalProvider {
             exec_command,
             destroy_command,
             download_command,
+            exec_and_fetch_command,
             env,
             Instant::now(),
             self.cpu_cores,

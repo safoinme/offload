@@ -86,6 +86,12 @@ pub struct TestRunner<'a, S, D> {
     artifact_config: ArtifactConfig,
 }
 
+/// Replace filesystem-unsafe characters in a sandbox id so it can be
+/// used as a filename component.
+fn sanitize_sandbox_id(id: &str) -> String {
+    id.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
+}
+
 /// Build a `find` command string from glob patterns.
 ///
 /// Converts glob patterns into a `find -path` command. Each pattern is
@@ -187,12 +193,21 @@ impl<'a, S: Sandbox, D: TestFramework> TestRunner<'a, S, D> {
         cmd: &crate::provider::Command,
         output_id: &str,
     ) -> Result<Option<crate::provider::ExecResult>> {
+        let stream = self.sandbox.exec_stream(cmd).await?;
+        self.drain_stream(stream, output_id).await
+    }
+
+    /// Drains an output stream into an `ExecResult`, honoring the
+    /// cancellation token if one is configured.
+    async fn drain_stream(
+        &mut self,
+        mut stream: crate::provider::OutputStream,
+        output_id: &str,
+    ) -> Result<Option<crate::provider::ExecResult>> {
         let start = std::time::Instant::now();
         let mut stdout = String::new();
         let mut stderr = String::new();
         let mut exit_code: Option<i32> = None;
-
-        let mut stream = self.sandbox.exec_stream(cmd).await?;
 
         // If we have a cancellation token, use select! to race against it
         if let Some(ref token) = self.cancellation_token {
@@ -325,31 +340,54 @@ impl<'a, S: Sandbox, D: TestFramework> TestRunner<'a, S, D> {
             cmd.to_shell_string()
         );
 
-        // Execute the command with streaming (always use streaming for default provider support)
+        // Pre-allocate the destination path inside parts_dir so the fused
+        // exec+fetch path writes directly where try_download_results would.
+        let safe_sandbox_id = sanitize_sandbox_id(&sandbox_id);
+        let prefetched_result_path = match std::fs::create_dir_all(&self.parts_dir) {
+            Ok(()) => Some(self.parts_dir.join(format!("{}.xml", safe_sandbox_id))),
+            Err(e) => {
+                warn!("Failed to create parts dir {:?}: {}", self.parts_dir, e);
+                None
+            }
+        };
+
         let _exec_span = self.tracer.span(
             "exec_batch",
             "exec",
             self.sandbox_pid,
             crate::trace::TID_EXEC,
         );
-        let exec_result = match self.exec_with_streaming(&cmd, "batch").await? {
-            Some(result) => result,
-            None => {
-                // Cancelled - return early without recording results
-                warn!(
-                    "[BATCH CANCELLED] Sandbox {} was cancelled before completion ({} tests lost)",
-                    sandbox_id, expected_count
-                );
-                return Ok(BatchOutcome::Cancelled);
-            }
+        let remote_result_path_buf = std::path::PathBuf::from(&result_path);
+        let fused_stream = if let Some(ref local_path) = prefetched_result_path {
+            self.sandbox
+                .exec_and_fetch_stream(
+                    &cmd,
+                    (remote_result_path_buf.as_path(), local_path.as_path()),
+                )
+                .await?
+        } else {
+            None
+        };
+        let used_fused_path = fused_stream.is_some();
+        let maybe_exec_result = if let Some(stream) = fused_stream {
+            self.drain_stream(stream, "batch").await?
+        } else {
+            self.exec_with_streaming(&cmd, "batch").await?
+        };
+        let Some(exec_result) = maybe_exec_result else {
+            warn!(
+                "[BATCH CANCELLED] Sandbox {} was cancelled before completion ({} tests lost)",
+                sandbox_id, expected_count
+            );
+            return Ok(BatchOutcome::Cancelled);
         };
         drop(_exec_span);
 
         let duration = start.elapsed();
 
         info!(
-            "[BATCH COMPLETE] Sandbox {} finished execution: exit_code={}, duration={:?}",
-            sandbox_id, exec_result.exit_code, duration
+            "[BATCH COMPLETE] Sandbox {} finished execution: exit_code={}, duration={:?} fused={}",
+            sandbox_id, exec_result.exit_code, duration, used_fused_path
         );
 
         // Calculate unique test count (what pytest will actually produce)
@@ -363,7 +401,15 @@ impl<'a, S: Sandbox, D: TestFramework> TestRunner<'a, S, D> {
             self.sandbox_pid,
             crate::trace::TID_IO,
         );
-        let batch_had_failures = match self.try_download_results(&result_path, unique_count).await {
+        let batch_had_failures = match self
+            .ingest_results(
+                &result_path,
+                unique_count,
+                used_fused_path,
+                prefetched_result_path.as_deref(),
+            )
+            .await
+        {
             Some((raw_content, _raw_count)) => {
                 info!(
                     "[BATCH RESULTS] Sandbox {} downloaded result file: total={}, unique={}, bytes={}",
@@ -453,6 +499,67 @@ impl<'a, S: Sandbox, D: TestFramework> TestRunner<'a, S, D> {
         } else {
             Ok(BatchOutcome::Success)
         }
+    }
+
+    /// Ingest the JUnit result file for a batch.
+    ///
+    /// When `used_fused_path` is true the remote junit.xml has already
+    /// been written to `prefetched_local` (inside `parts_dir`) by the
+    /// fused exec+fetch call, so no additional provider round-trip is
+    /// needed — just read the file, check it, and log parts. Otherwise
+    /// fall back to `try_download_results`, which downloads to the
+    /// same location and returns the same shape.
+    async fn ingest_results(
+        &mut self,
+        result_path: &str,
+        expected_count: usize,
+        used_fused_path: bool,
+        prefetched_local: Option<&std::path::Path>,
+    ) -> Option<(String, usize)> {
+        if !used_fused_path {
+            return self.try_download_results(result_path, expected_count).await;
+        }
+
+        let sandbox_id = self.sandbox.id().to_string();
+        let local = prefetched_local?;
+        let content = match std::fs::read_to_string(local) {
+            Ok(c) => c,
+            Err(e) => {
+                error!(
+                    "[FUSED FETCH] Sandbox {} failed to read prefetched {:?}: {}",
+                    sandbox_id, local, e
+                );
+                return None;
+            }
+        };
+        if content.is_empty() {
+            error!(
+                "[FUSED FETCH] Sandbox {} prefetched junit.xml is empty at {:?}",
+                sandbox_id, local
+            );
+            return None;
+        }
+        let actual_count = count_testcases_in_xml(&content);
+        debug!(
+            "[FUSED FETCH] Sandbox {} junit.xml: {} bytes, {} testcases (expected {})",
+            sandbox_id,
+            content.len(),
+            actual_count,
+            expected_count
+        );
+        info!(
+            "[PARTS] Saved {} to {:?} ({} bytes, {} testcases)",
+            sandbox_id,
+            local,
+            content.len(),
+            actual_count
+        );
+        if let Ok(entries) = std::fs::read_dir(local.parent().unwrap_or(local)) {
+            let count = entries.filter(|e| e.is_ok()).count();
+            info!("[PARTS] Directory now has {} files", count);
+        }
+
+        Some((content, actual_count))
     }
 
     /// Try to download test results from the sandbox.

@@ -182,6 +182,11 @@ impl SandboxProvider for DefaultProvider {
             .download_command
             .as_ref()
             .map(|cmd| cmd.replace("{cpu_cores}", &cpu_cores_str));
+        let exec_and_fetch_command = self
+            .config
+            .exec_and_fetch_command
+            .as_ref()
+            .map(|cmd| cmd.replace("{cpu_cores}", &cpu_cores_str));
 
         Ok(DefaultSandbox {
             id: remote_id,
@@ -189,6 +194,7 @@ impl SandboxProvider for DefaultProvider {
             exec_command,
             destroy_command,
             download_command,
+            exec_and_fetch_command,
             env,
             created_at: Instant::now(),
             cpu_cores,
@@ -227,6 +233,7 @@ pub struct DefaultSandbox {
     exec_command: String,
     destroy_command: String,
     download_command: Option<String>,
+    exec_and_fetch_command: Option<String>,
     env: Vec<(String, String)>,
     created_at: Instant,
     cpu_cores: f64,
@@ -242,6 +249,7 @@ impl DefaultSandbox {
         exec_command: String,
         destroy_command: String,
         download_command: Option<String>,
+        exec_and_fetch_command: Option<String>,
         env: Vec<(String, String)>,
         created_at: Instant,
         cpu_cores: f64,
@@ -252,15 +260,17 @@ impl DefaultSandbox {
             exec_command,
             destroy_command,
             download_command,
+            exec_and_fetch_command,
             env,
             created_at,
             cpu_cores,
         }
     }
 
-    /// Build the exec command with substitutions.
-    fn build_exec_command(&self, cmd: &Command) -> String {
-        // Build env var prefix (KEY=value KEY2=value2 ...)
+    /// Build the inner shell command (env prefix + program + args, optionally
+    /// wrapped in `cd OFFLOAD_ROOT && ...`). Used by both `build_exec_command`
+    /// and `build_exec_and_fetch_command`.
+    fn build_inner_shell_command(&self, cmd: &Command) -> String {
         let env_prefix = self
             .env
             .iter()
@@ -268,32 +278,31 @@ impl DefaultSandbox {
             .collect::<Vec<_>>()
             .join(" ");
 
-        // Build the inner command with properly escaped arguments
         let program_and_args = std::iter::once(cmd.program.as_str())
             .chain(cmd.args.iter().map(|s| s.as_str()))
             .map(|a| shell_words::quote(a).into_owned())
             .collect::<Vec<_>>()
             .join(" ");
 
-        // Combine env prefix and command
         let inner_cmd = if env_prefix.is_empty() {
             program_and_args
         } else {
             format!("{} {}", env_prefix, program_and_args)
         };
 
-        // Prepend cd to project root if OFFLOAD_ROOT is set
-        let inner_cmd = match self.env.iter().find(|(k, _)| k == "OFFLOAD_ROOT") {
+        match self.env.iter().find(|(k, _)| k == "OFFLOAD_ROOT") {
             Some((_, root)) => format!("cd {} && {}", shell_words::quote(root), inner_cmd),
             None => inner_cmd,
-        };
+        }
+    }
 
-        // Escape the entire command so it can be passed as a single shell argument
-        let escaped_cmd = shell_words::quote(&inner_cmd);
-
+    /// Build the exec command with substitutions.
+    fn build_exec_command(&self, cmd: &Command) -> String {
+        let inner = self.build_inner_shell_command(cmd);
+        let escaped = shell_words::quote(&inner);
         self.exec_command
             .replace("{sandbox_id}", &self.id)
-            .replace("{command}", &escaped_cmd)
+            .replace("{command}", &escaped)
     }
 
     /// Build the destroy command with substitutions.
@@ -321,6 +330,27 @@ impl DefaultSandbox {
                 .replace("{paths}", &paths_str)
         })
     }
+
+    /// Build the fused exec+fetch command by substituting `{sandbox_id}`,
+    /// `{command}`, and `{fetch}` into the configured template.
+    fn build_exec_and_fetch_command(
+        &self,
+        cmd: &Command,
+        remote: &Path,
+        local: &Path,
+    ) -> Option<String> {
+        let template = self.exec_and_fetch_command.as_ref()?;
+        let inner = self.build_inner_shell_command(cmd);
+        let escaped_cmd = shell_words::quote(&inner);
+        let fetch_pair = format!("{}:{}", remote.to_string_lossy(), local.to_string_lossy());
+        let escaped_fetch = shell_words::quote(&fetch_pair);
+        Some(
+            template
+                .replace("{sandbox_id}", &self.id)
+                .replace("{command}", &escaped_cmd)
+                .replace("{fetch}", &escaped_fetch),
+        )
+    }
 }
 
 #[async_trait]
@@ -333,6 +363,20 @@ impl Sandbox for DefaultSandbox {
         let shell_cmd = self.build_exec_command(cmd);
         debug!("Streaming on {}: {}", self.id, shell_cmd);
         self.connector.run_stream(&shell_cmd).await
+    }
+
+    async fn exec_and_fetch_stream(
+        &self,
+        cmd: &Command,
+        fetch: (&Path, &Path),
+    ) -> ProviderResult<Option<OutputStream>> {
+        let (remote, local) = fetch;
+        let Some(shell_cmd) = self.build_exec_and_fetch_command(cmd, remote, local) else {
+            return Ok(None);
+        };
+        debug!("Fused exec+fetch on {}: {}", self.id, shell_cmd);
+        let stream = self.connector.run_stream(&shell_cmd).await?;
+        Ok(Some(stream))
     }
 
     async fn download(&self, paths: &[(&Path, &Path)]) -> ProviderResult<()> {
@@ -406,6 +450,7 @@ mod tests {
             exec_command: "exec --sandbox {sandbox_id} --cmd {command}".to_string(),
             destroy_command: "destroy {sandbox_id}".to_string(),
             download_command: None,
+            exec_and_fetch_command: None,
             env,
             created_at: Instant::now(),
             cpu_cores: 1.0,
@@ -665,6 +710,51 @@ mod tests {
     }
 
     #[test]
+    fn test_build_exec_and_fetch_command_none_when_unset() {
+        let sandbox = sandbox_with_env(vec![]);
+        let command = cmd("pytest", &["-v"]);
+        let result = sandbox.build_exec_and_fetch_command(
+            &command,
+            std::path::Path::new("/tmp/junit.xml"),
+            std::path::Path::new("/local/junit.xml"),
+        );
+        assert!(
+            result.is_none(),
+            "exec_and_fetch should be None when template unset"
+        );
+    }
+
+    #[test]
+    fn test_build_exec_and_fetch_command_substitutes_placeholders() {
+        let mut sandbox = sandbox_with_env(vec![]);
+        sandbox.exec_and_fetch_command = Some(
+            "python modal_sandbox.py exec-and-fetch {sandbox_id} {command} --fetch {fetch}"
+                .to_string(),
+        );
+        let command = cmd("pytest", &["tests/foo.py::test_bar"]);
+        let result = sandbox
+            .build_exec_and_fetch_command(
+                &command,
+                std::path::Path::new("/tmp/result.xml"),
+                std::path::Path::new("/tmp/local-result.xml"),
+            )
+            .expect("template is set");
+
+        assert!(result.contains("sb-test-123"), "sandbox id: {result}");
+        assert!(result.contains("exec-and-fetch"), "subcommand: {result}");
+        assert!(result.contains("pytest"), "program: {result}");
+        assert!(
+            result.contains("tests/foo.py::test_bar"),
+            "test id: {result}"
+        );
+        assert!(result.contains("--fetch"), "fetch flag: {result}");
+        assert!(
+            result.contains("/tmp/result.xml:/tmp/local-result.xml"),
+            "fetch pair: {result}"
+        );
+    }
+
+    #[test]
     fn cost_estimate_scales_with_cpu_cores() {
         use crate::provider::Sandbox;
 
@@ -674,6 +764,7 @@ mod tests {
             exec_command: String::new(),
             destroy_command: String::new(),
             download_command: None,
+            exec_and_fetch_command: None,
             env: vec![],
             created_at: Instant::now() - std::time::Duration::from_secs(100),
             cpu_cores: 2.0,
@@ -703,6 +794,7 @@ mod tests {
             exec_command: String::new(),
             destroy_command: String::new(),
             download_command: None,
+            exec_and_fetch_command: None,
             env: vec![],
             created_at: Instant::now() - std::time::Duration::from_secs(100),
             cpu_cores: 0.125,
@@ -755,6 +847,7 @@ mod tests {
             download_command: Some(
                 "uv run @modal_sandbox.py download {sandbox_id} {paths}".to_string(),
             ),
+            exec_and_fetch_command: None,
             working_dir: Some(temp_dir.path().to_path_buf()),
             timeout_secs: 300,
             env: Default::default(),

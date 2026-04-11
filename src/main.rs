@@ -732,6 +732,7 @@ fn init_config(provider: &str, framework: &str) -> Result<()> {
             destroy_command: "./scripts/destroy-sandbox.sh {sandbox_id}".into(),
             prepare_command: None,
             download_command: None,
+            exec_and_fetch_command: None,
             working_dir: None,
             timeout_secs: 3600,
             copy_dirs: vec![],
