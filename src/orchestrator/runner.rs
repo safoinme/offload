@@ -439,9 +439,9 @@ impl<'a, S: Sandbox, D: TestFramework> TestRunner<'a, S, D> {
 
                 // Save processed JUnit XML to parts dir (overwrites raw download)
                 {
-                    let safe_id =
-                        sandbox_id.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
-                    let part_file = self.parts_dir.join(format!("{}.xml", safe_id));
+                    let part_file = self
+                        .parts_dir
+                        .join(format!("{}.xml", sanitize_sandbox_id(&sandbox_id)));
                     if let Err(e) = std::fs::write(&part_file, &junit_xml) {
                         warn!("Failed to save processed part file {:?}: {}", part_file, e);
                     }
@@ -501,14 +501,8 @@ impl<'a, S: Sandbox, D: TestFramework> TestRunner<'a, S, D> {
         }
     }
 
-    /// Ingest the JUnit result file for a batch.
-    ///
-    /// When `used_fused_path` is true the remote junit.xml has already
-    /// been written to `prefetched_local` (inside `parts_dir`) by the
-    /// fused exec+fetch call, so no additional provider round-trip is
-    /// needed — just read the file, check it, and log parts. Otherwise
-    /// fall back to `try_download_results`, which downloads to the
-    /// same location and returns the same shape.
+    /// Read the JUnit result file for a batch, either from the fused
+    /// prefetch (already in `parts_dir`) or by downloading it.
     async fn ingest_results(
         &mut self,
         result_path: &str,
@@ -532,16 +526,32 @@ impl<'a, S: Sandbox, D: TestFramework> TestRunner<'a, S, D> {
                 return None;
             }
         };
+        self.finalize_result_content(content, expected_count, local, "FUSED FETCH")
+    }
+
+    /// Validate the JUnit content and log parts-dir stats. Shared between
+    /// the fused and download paths.
+    fn finalize_result_content(
+        &self,
+        content: String,
+        expected_count: usize,
+        result_path: &std::path::Path,
+        source_tag: &str,
+    ) -> Option<(String, usize)> {
+        let sandbox_id = self.sandbox.id().to_string();
+
         if content.is_empty() {
             error!(
-                "[FUSED FETCH] Sandbox {} prefetched junit.xml is empty at {:?}",
-                sandbox_id, local
+                "[{}] Sandbox {} junit.xml is empty!",
+                source_tag, sandbox_id
             );
             return None;
         }
+
         let actual_count = count_testcases_in_xml(&content);
         debug!(
-            "[FUSED FETCH] Sandbox {} junit.xml: {} bytes, {} testcases (expected {})",
+            "[{}] Sandbox {} junit.xml: {} bytes, {} testcases (expected {})",
+            source_tag,
             sandbox_id,
             content.len(),
             actual_count,
@@ -550,11 +560,11 @@ impl<'a, S: Sandbox, D: TestFramework> TestRunner<'a, S, D> {
         info!(
             "[PARTS] Saved {} to {:?} ({} bytes, {} testcases)",
             sandbox_id,
-            local,
+            result_path,
             content.len(),
             actual_count
         );
-        if let Ok(entries) = std::fs::read_dir(local.parent().unwrap_or(local)) {
+        if let Ok(entries) = std::fs::read_dir(result_path.parent().unwrap_or(result_path)) {
             let count = entries.filter(|e| e.is_ok()).count();
             info!("[PARTS] Directory now has {} files", count);
         }
@@ -577,8 +587,9 @@ impl<'a, S: Sandbox, D: TestFramework> TestRunner<'a, S, D> {
             warn!("Failed to create parts dir {:?}: {}", self.parts_dir, e);
             return None;
         }
-        let safe_id = sandbox_id.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
-        let download_path = self.parts_dir.join(format!("{}.xml", safe_id));
+        let download_path = self
+            .parts_dir
+            .join(format!("{}.xml", sanitize_sandbox_id(&sandbox_id)));
 
         debug!(
             "[DOWNLOAD] Sandbox {} downloading {}...",
@@ -607,39 +618,7 @@ impl<'a, S: Sandbox, D: TestFramework> TestRunner<'a, S, D> {
             }
         };
 
-        if content.is_empty() {
-            error!(
-                "[DOWNLOAD EMPTY] Sandbox {} downloaded empty junit.xml!",
-                sandbox_id
-            );
-            return None;
-        }
-
-        // Count testcases in the XML
-        let actual_count = count_testcases_in_xml(&content);
-        debug!(
-            "[DOWNLOAD] Sandbox {} junit.xml: {} bytes, {} testcases (expected {})",
-            sandbox_id,
-            content.len(),
-            actual_count,
-            expected_count
-        );
-
-        info!(
-            "[PARTS] Saved {} to {:?} ({} bytes, {} testcases)",
-            sandbox_id,
-            download_path,
-            content.len(),
-            actual_count
-        );
-
-        // Log parts dir stats
-        if let Ok(entries) = std::fs::read_dir(download_path.parent().unwrap_or(&download_path)) {
-            let count = entries.filter(|e| e.is_ok()).count();
-            info!("[PARTS] Directory now has {} files", count);
-        }
-
-        Some((content, actual_count))
+        self.finalize_result_content(content, expected_count, &download_path, "DOWNLOAD")
     }
 
     /// Download artifacts matching configured glob patterns from the sandbox.
@@ -657,7 +636,7 @@ impl<'a, S: Sandbox, D: TestFramework> TestRunner<'a, S, D> {
 
         let batch_idx = self.batch_idx;
         let sandbox_id = self.sandbox.id().to_string();
-        let safe_id = sandbox_id.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
+        let safe_id = sanitize_sandbox_id(&sandbox_id);
         let tar_remote_path = format!("/tmp/offload-artifacts-{}-{}.tar.gz", safe_id, batch_idx);
 
         // Build a single find+tar pipeline. Uses -print0/--null for safe handling
