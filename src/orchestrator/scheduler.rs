@@ -15,6 +15,10 @@ use crate::framework::TestInstance;
 pub struct ScheduledBatch<'a> {
     pub tests: Vec<TestInstance<'a>>,
     estimated_load: Duration,
+    /// True iff every test in the batch had a historical duration entry. When
+    /// false, `estimated_load` came from the 1s fallback (or a partially-populated
+    /// group average) and is not trustworthy enough to drive the requeue timer.
+    has_historical_estimate: bool,
 }
 
 impl<'a> ScheduledBatch<'a> {
@@ -22,7 +26,20 @@ impl<'a> ScheduledBatch<'a> {
     pub fn estimated_load(&self) -> Duration {
         self.estimated_load
     }
+
+    /// Whether every test in this batch had a historical duration from a prior run.
+    pub fn has_historical_estimate(&self) -> bool {
+        self.has_historical_estimate
+    }
 }
+
+/// Minimum wall-clock wait before a batch is considered stuck and re-queued.
+///
+/// Even when historical estimates exist, cold-start overhead (sandbox boot,
+/// pytest import, first-time image layer pulls) can add tens of seconds that
+/// aren't reflected in per-test durations. A 5 minute floor avoids speculative
+/// duplication of batches that are healthy but slow to ramp up.
+const MIN_REQUEUE_THRESHOLD: Duration = Duration::from_secs(300);
 
 /// Maximum total length (in chars) of all test IDs in a single batch.
 ///
@@ -40,6 +57,11 @@ struct Batch<'a> {
     load: Duration,
     command_len: usize,
     test_ids: HashSet<String>,
+    /// True iff every test added so far had a historical duration entry. Flipped
+    /// to false the first time a test is added that relied on the group/default
+    /// fallback. Used to decide whether the resulting `ScheduledBatch` has a
+    /// trustworthy estimate for requeue timing.
+    all_from_history: bool,
 }
 
 impl<'a> Batch<'a> {
@@ -49,14 +71,16 @@ impl<'a> Batch<'a> {
             load: Duration::ZERO,
             command_len: 0,
             test_ids: HashSet::new(),
+            all_from_history: true,
         }
     }
 
-    fn add(&mut self, test: TestInstance<'a>, duration: Duration) {
+    fn add(&mut self, test: TestInstance<'a>, duration: Duration, from_history: bool) {
         self.command_len += test.id().len();
         self.test_ids.insert(test.id().to_string());
         self.tests.push(test);
         self.load += duration;
+        self.all_from_history &= from_history;
     }
 
     fn contains(&self, test_id: &str) -> bool {
@@ -89,6 +113,7 @@ pub struct Scheduler<'a> {
     queue: Mutex<VecDeque<ScheduledBatch<'a>>>,
     batch_count: usize,
     batch_sizes: Vec<usize>,
+    min_requeue_threshold: Duration,
 }
 
 impl<'a> Scheduler<'a> {
@@ -131,6 +156,7 @@ impl<'a> Scheduler<'a> {
                 queue: Mutex::new(VecDeque::new()),
                 batch_count: 0,
                 batch_sizes: Vec::new(),
+                min_requeue_threshold: MIN_REQUEUE_THRESHOLD,
             };
         }
 
@@ -142,14 +168,14 @@ impl<'a> Scheduler<'a> {
         let individual_batches: Vec<ScheduledBatch<'a>> = individual_tests
             .into_iter()
             .map(|t| {
-                let load = durations
-                    .get(t.id())
-                    .copied()
+                let historical = durations.get(t.id()).copied();
+                let load = historical
                     .or_else(|| group_to_default_duration.get(t.group()).copied())
                     .unwrap_or(Duration::from_secs(1));
                 ScheduledBatch {
                     tests: vec![t],
                     estimated_load: load,
+                    has_historical_estimate: historical.is_some(),
                 }
             })
             .collect();
@@ -161,15 +187,18 @@ impl<'a> Scheduler<'a> {
                 queue: Mutex::new(VecDeque::from(individual_batches)),
                 batch_count,
                 batch_sizes,
+                min_requeue_threshold: MIN_REQUEUE_THRESHOLD,
             };
         }
 
-        // Look up durations for each test, sorted longest-first
-        let mut tests_with_duration: Vec<_> = normal_tests
+        // Look up durations for each test, sorted longest-first. `from_history`
+        // records whether the duration came from prior-run data (vs. a fallback),
+        // so we can later tell which batches have trustworthy estimates.
+        let mut tests_with_duration: Vec<(TestInstance<'a>, Duration, bool)> = normal_tests
             .iter()
             .map(|t| {
-                let duration = match durations.get(t.id()) {
-                    Some(&d) => d,
+                let (duration, from_history) = match durations.get(t.id()) {
+                    Some(&d) => (d, true),
                     None => {
                         let fallback = group_to_default_duration
                             .get(t.group())
@@ -181,10 +210,10 @@ impl<'a> Scheduler<'a> {
                             t.group(),
                             fallback,
                         );
-                        fallback
+                        (fallback, false)
                     }
                 };
-                (*t, duration)
+                (*t, duration, from_history)
             })
             .collect();
         tests_with_duration.sort_by(|a, b| b.1.cmp(&a.1));
@@ -194,7 +223,7 @@ impl<'a> Scheduler<'a> {
         let mut batches: Vec<Batch<'a>> = (0..num_batches).map(|_| Batch::new()).collect();
 
         // LPT assignment: assign each test to the lightest eligible batch
-        for (test, duration) in tests_with_duration {
+        for (test, duration, from_history) in tests_with_duration {
             let test_id = test.id();
 
             let target_idx = (0..batches.len())
@@ -209,7 +238,7 @@ impl<'a> Scheduler<'a> {
                 batches.len() - 1
             });
 
-            batches[idx].add(test, duration);
+            batches[idx].add(test, duration, from_history);
         }
 
         // Sort by load descending (heaviest first) for optimal Modal scheduling
@@ -224,6 +253,7 @@ impl<'a> Scheduler<'a> {
                 .map(|b| ScheduledBatch {
                     estimated_load: b.load,
                     tests: b.tests,
+                    has_historical_estimate: b.all_from_history,
                 }),
         );
 
@@ -233,7 +263,18 @@ impl<'a> Scheduler<'a> {
             queue: Mutex::new(VecDeque::from(result)),
             batch_count,
             batch_sizes,
+            min_requeue_threshold: MIN_REQUEUE_THRESHOLD,
         }
+    }
+
+    /// Overrides the minimum requeue threshold.
+    ///
+    /// Primarily intended for tests that want to trigger the requeue path with
+    /// sub-second synthetic durations. Production callers should use the
+    /// default (see [`MIN_REQUEUE_THRESHOLD`]).
+    pub fn with_min_requeue_threshold(mut self, threshold: Duration) -> Self {
+        self.min_requeue_threshold = threshold;
+        self
     }
 
     /// Removes and returns the next batch from the queue.
@@ -261,15 +302,30 @@ impl<'a> Scheduler<'a> {
 
     /// Runs a future for a batch with hedged re-queuing.
     ///
-    /// Computes a timeout of `2 * batch.estimated_load()`. If the future
-    /// completes before that deadline, its result is returned immediately.
-    /// If the timeout fires, the batch is split (or cloned if single-test)
-    /// and re-queued, then the original future is awaited to completion.
+    /// If the batch has a trustworthy historical estimate, computes a timeout
+    /// of `max(2 * batch.estimated_load(), MIN_REQUEUE_THRESHOLD)`. If the
+    /// future completes before that deadline, its result is returned
+    /// immediately. If the timeout fires, the batch is split (or cloned if
+    /// single-test) and re-queued, then the original future is awaited to
+    /// completion.
+    ///
+    /// When the batch has no historical estimate (first run / cold start),
+    /// requeue is disabled entirely: the 1-second-per-test fallback used for
+    /// scheduling is not predictive of real execution time, so speculatively
+    /// re-queuing based on it just produces duplicate work that has to be
+    /// cancelled once the originals complete.
     pub async fn register_running_batch<Fut, R>(&self, batch: &ScheduledBatch<'a>, fut: Fut) -> R
     where
         Fut: Future<Output = R>,
     {
-        let requeue_after = 2 * batch.estimated_load();
+        if !batch.has_historical_estimate {
+            // No historical data → estimated_load is the 1s/test fallback.
+            // Basing a requeue timer on it causes spurious duplication on cold
+            // starts. Just run to completion.
+            return fut.await;
+        }
+
+        let requeue_after = (2 * batch.estimated_load()).max(self.min_requeue_threshold);
 
         tokio::pin!(fut);
 
@@ -290,10 +346,12 @@ impl<'a> Scheduler<'a> {
                     self.push(ScheduledBatch {
                         tests: batch.tests[..mid].to_vec(),
                         estimated_load: first_load,
+                        has_historical_estimate: batch.has_historical_estimate,
                     });
                     self.push(ScheduledBatch {
                         tests: batch.tests[mid..].to_vec(),
                         estimated_load: second_load,
+                        has_historical_estimate: batch.has_historical_estimate,
                     });
                 } else {
                     self.push(batch.clone());
@@ -808,7 +866,10 @@ mod tests {
 
         // 1 worker => all 4 tests in one batch, estimated_load = 4ms
         // requeue_after = 2 * 4ms = 8ms — sleep of 50ms will exceed that
-        let scheduler = Scheduler::new(1, &tests, &durations, &HashMap::new(), None);
+        // Override the production 300s floor so the sub-second estimate is
+        // actually what gates requeue.
+        let scheduler = Scheduler::new(1, &tests, &durations, &HashMap::new(), None)
+            .with_min_requeue_threshold(Duration::ZERO);
         let batch = scheduler
             .pop()
             .ok_or_else(|| anyhow::anyhow!("expected a batch"))?;
@@ -843,8 +904,10 @@ mod tests {
         let mut durations = HashMap::new();
         durations.insert("test_a".to_string(), Duration::from_millis(1));
 
-        // 1 worker, 1 test, estimated_load = 1ms, requeue_after = 2ms
-        let scheduler = Scheduler::new(1, &tests, &durations, &HashMap::new(), None);
+        // 1 worker, 1 test, estimated_load = 1ms, requeue_after = 2ms.
+        // Override the production 300s floor for synthetic sub-second test.
+        let scheduler = Scheduler::new(1, &tests, &durations, &HashMap::new(), None)
+            .with_min_requeue_threshold(Duration::ZERO);
         let batch = scheduler
             .pop()
             .ok_or_else(|| anyhow::anyhow!("expected a batch"))?;
@@ -863,6 +926,73 @@ mod tests {
         assert!(
             scheduler.pop().is_none(),
             "queue should be empty after one pop"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_register_running_batch_skips_requeue_without_history() -> anyhow::Result<()> {
+        // Cold-start scenario: no prior junit.xml, so `durations` is empty and
+        // scheduling falls through to the 1s/test fallback. The resulting
+        // estimate is not predictive, so `register_running_batch` must NOT
+        // requeue even if the future outruns the fallback-based threshold.
+        let records = [
+            TestRecord::new("test_a", "test-group"),
+            TestRecord::new("test_b", "test-group"),
+        ];
+        let tests: Vec<_> = records.iter().map(|r| r.test()).collect();
+
+        let scheduler = Scheduler::new(1, &tests, &HashMap::new(), &HashMap::new(), None)
+            .with_min_requeue_threshold(Duration::ZERO);
+        let batch = scheduler
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("expected a batch"))?;
+        assert!(
+            !batch.has_historical_estimate(),
+            "batch built from empty durations should flag as cold-start"
+        );
+
+        // Sleep way past 2x the estimate. With the old logic this would have
+        // triggered requeue; with the new guard it must not.
+        scheduler
+            .register_running_batch(&batch, tokio::time::sleep(Duration::from_millis(30)))
+            .await;
+
+        assert!(
+            scheduler.pop().is_none(),
+            "no batches should have been re-queued on cold start"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_register_running_batch_respects_min_requeue_floor() -> anyhow::Result<()> {
+        // Even with full historical data, the floor must prevent sub-floor
+        // estimates from triggering speculative requeue.
+        let records = [TestRecord::new("test_a", "test-group")];
+        let tests: Vec<_> = records.iter().map(|r| r.test()).collect();
+
+        let mut durations = HashMap::new();
+        durations.insert("test_a".to_string(), Duration::from_millis(1));
+
+        // Keep the production default 300s floor — the 2ms "2x estimate" must
+        // not be allowed to drive requeue.
+        let scheduler = Scheduler::new(1, &tests, &durations, &HashMap::new(), None);
+        let batch = scheduler
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("expected a batch"))?;
+        assert!(
+            batch.has_historical_estimate(),
+            "batch with full durations should be flagged historical"
+        );
+
+        scheduler
+            .register_running_batch(&batch, tokio::time::sleep(Duration::from_millis(30)))
+            .await;
+
+        assert!(
+            scheduler.pop().is_none(),
+            "requeue must not fire below min_requeue_threshold"
         );
         Ok(())
     }

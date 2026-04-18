@@ -375,10 +375,28 @@ impl<'a, S: Sandbox, D: TestFramework> TestRunner<'a, S, D> {
             self.exec_with_streaming(&cmd, "batch").await?
         };
         let Some(exec_result) = maybe_exec_result else {
-            warn!(
-                "[BATCH CANCELLED] Sandbox {} was cancelled before completion ({} tests lost)",
-                sandbox_id, expected_count
-            );
+            // A `None` result means `drain_stream` saw the cancellation token
+            // fire before the exec finished. Early-stop is the only caller
+            // that cancels the token today: it fires once every expected test
+            // is accounted for in the master JUnit report, which means any
+            // in-flight batch has already been covered elsewhere (typically a
+            // speculative requeue duplicate). Distinguish the two cases
+            // explicitly so we never silently hide real data loss.
+            let cancelled_by_early_stop = self
+                .cancellation_token
+                .as_ref()
+                .is_some_and(|t| t.is_cancelled());
+            if cancelled_by_early_stop {
+                info!(
+                    "[BATCH CANCELLED] Sandbox {} stopped early: {} tests already covered by another batch",
+                    sandbox_id, expected_count
+                );
+            } else {
+                error!(
+                    "[BATCH CANCELLED] Sandbox {} was cancelled before completion without early-stop; {} tests will not be reported",
+                    sandbox_id, expected_count
+                );
+            }
             return Ok(BatchOutcome::Cancelled);
         };
         drop(_exec_span);
