@@ -58,15 +58,37 @@ impl PytestFramework {
     }
 
     /// Parse `pytest --collect-only -q` output to extract test records.
+    ///
+    /// `-q` prints one test id per line (e.g.
+    /// `tests/test_foo.py::test_bar` or
+    /// `tests/test_foo.py::test_bar[param with spaces]`) plus a trailing
+    /// `N tests collected` summary, blank lines, and any pytest warnings or
+    /// error blocks (`<SomeError ...>`). Parametrize ids can legitimately
+    /// contain whitespace, `-`, `/`, `:`, and other punctuation — the only
+    /// reliable marker is the `::` separator between file path and node id
+    /// combined with a non-space first character (so we skip the indented
+    /// summary / warning lines that pytest emits).
     fn parse_collect_output(&self, output: &str, group: &str) -> Vec<TestRecord> {
         let mut tests = Vec::new();
 
         for line in output.lines() {
-            let trimmed = line.trim();
-            // Simple format: tests/test_foo.py::test_bar
-            if trimmed.contains("::") && !trimmed.starts_with('<') && !trimmed.contains(' ') {
-                tests.push(TestRecord::new(trimmed, group));
+            // Use the raw line rather than `trim()`, so that indented
+            // non-test output (warnings, tracebacks, the "N tests collected"
+            // summary) is skipped via the "starts with whitespace" check.
+            let first_char = line.chars().next();
+            if !matches!(first_char, Some(c) if !c.is_whitespace()) {
+                continue;
             }
+            if line.starts_with('<') {
+                // `<Module ... >`, `<ErrorRepr ...>`, etc. from pytest.
+                continue;
+            }
+            // A real test id must contain `::` separating the file path
+            // from the node id.
+            if !line.contains("::") {
+                continue;
+            }
+            tests.push(TestRecord::new(line, group));
         }
 
         tests
@@ -272,6 +294,80 @@ mod tests {
         assert!(cmd.args.contains(&"--timeout=30".to_string()));
         assert!(cmd.args.contains(&"tests/test_a.py::test_one".to_string()));
         Ok(())
+    }
+
+    fn fw() -> PytestFramework {
+        PytestFramework::new(PytestFrameworkConfig {
+            command: "python -m pytest".to_string(),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn test_parse_collect_output_simple_ids() {
+        let out = "\
+tests/unit/foo.py::test_one
+tests/unit/foo.py::test_two
+";
+        let ids: Vec<_> = fw()
+            .parse_collect_output(out, "unit")
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["tests/unit/foo.py::test_one", "tests/unit/foo.py::test_two"]
+        );
+    }
+
+    #[test]
+    fn test_parse_collect_output_keeps_parametrize_ids_with_spaces() {
+        // Regression: earlier parser rejected any line containing a space,
+        // which silently dropped parametrize ids with spaces / special
+        // characters from the schedule even though they collect fine.
+        let out = "\
+tests/integration/test_step_context.py::test_meta[Only custom name]
+tests/integration/test_step_context.py::test_meta[Custom name, metadata and tags]
+tests/integration/test_util.py::test_url[ftp://example.com - Must start with http]
+tests/unit/models/test_filter_models.py::test_fails[2022/12/12 12-12-12]
+
+5 tests collected in 0.12s
+";
+        let ids: Vec<_> = fw()
+            .parse_collect_output(out, "mixed")
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "tests/integration/test_step_context.py::test_meta[Only custom name]",
+                "tests/integration/test_step_context.py::test_meta[Custom name, metadata and tags]",
+                "tests/integration/test_util.py::test_url[ftp://example.com - Must start with http]",
+                "tests/unit/models/test_filter_models.py::test_fails[2022/12/12 12-12-12]",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_collect_output_skips_non_test_lines() {
+        // `-q` output can include error blocks, warnings, the trailing
+        // summary, blank lines, and indented traceback fragments. None of
+        // them should be interpreted as a test id.
+        let out = "\
+<ErrorRepr ('tests/bad.py', 1, 'ImportError: ...')>
+  WARNING: something
+tests/unit/foo.py::test_good[with spaces]
+
+1 tests collected in 0.02s
+";
+        let ids: Vec<_> = fw()
+            .parse_collect_output(out, "unit")
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["tests/unit/foo.py::test_good[with spaces]"]);
     }
 
     #[test]
