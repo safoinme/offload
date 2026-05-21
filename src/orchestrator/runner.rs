@@ -24,6 +24,15 @@ fn has_failures_in_xml(xml: &str) -> bool {
     xml.contains("<failure") || xml.contains("<error")
 }
 
+/// Build the remote path for a batch's JUnit result file.
+///
+/// A single sandbox runs many batches sequentially, so the path must be
+/// keyed by both sandbox ID and batch index — keying by sandbox ID alone
+/// lets a later batch download a stale earlier batch's result file.
+fn batch_result_path(sandbox_id: &str, batch_idx: usize, ext: &str) -> String {
+    format!("/tmp/{}-{}.{}", sandbox_id, batch_idx, ext)
+}
+
 /// Callback function for streaming test output.
 ///
 /// Called for each line of output during streaming execution. The callback
@@ -314,8 +323,9 @@ impl<'a, S: Sandbox, D: TestFramework> TestRunner<'a, S, D> {
             );
         }
 
-        // Generate a unique result path per sandbox to avoid collisions
-        let result_path = format!("/tmp/{}.{}", sandbox_id, self.framework.report_format());
+        // Generate a unique result path per sandbox and batch to avoid collisions
+        let result_path =
+            batch_result_path(&sandbox_id, self.batch_idx, self.framework.report_format());
 
         // Generate the run command for all tests
         let mut cmd =
@@ -769,6 +779,20 @@ mod tests {
     fn test_build_find_command_preserves_absolute_path() {
         let cmd = build_find_command(&["/tmp/*.dat".to_string()]);
         assert_eq!(cmd, "find . -type f -path '/tmp/*.dat'");
+    }
+
+    #[test]
+    fn test_batch_result_path_shape() {
+        assert_eq!(batch_result_path("sb-abc", 3, "xml"), "/tmp/sb-abc-3.xml");
+    }
+
+    #[test]
+    fn test_batch_result_path_distinct_per_batch() {
+        // Different batches on the same sandbox must get distinct paths,
+        // otherwise a later batch downloads a stale earlier result file.
+        let first = batch_result_path("sb-abc", 0, "xml");
+        let second = batch_result_path("sb-abc", 1, "xml");
+        assert_ne!(first, second);
     }
 
     /// Minimal framework stub for testing the runner without a real framework.
