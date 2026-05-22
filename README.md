@@ -286,8 +286,19 @@ Configuration is stored in a TOML file (default: `offload.toml`).
 | `sandbox_project_root` | string | (none) | Working directory for test execution, if different from `sandbox_repo_root`. Only needed in monorepo setups where tests run from a subdirectory (e.g. `/app/mypackage`) |
 | `sandbox_init_cmd` | string | (none) | Optional command to run during image build, after cwd/copy-dirs are applied |
 | `post_patch_cmd` | string | (none) | Optional command to run after thin-diff patch is applied, before image materialization. Runs as an image layer. `OFFLOAD_PATCH_FILE` env var is set to the patch path when a diff exists |
+| `impatiently_requeue_batches` | boolean | `true` | When `true`, the scheduler hedges against long-running batches by re-queuing each batch on pop (see "Split-requeue hedging" below) |
 
 Set `sandbox_repo_root` to tell Offload where the codebase lives in the sandbox. In monorepo setups where tests run from a subdirectory, also set `sandbox_project_root` to that subdirectory.
+
+#### Split-requeue hedging
+
+LPT scheduling minimizes makespan when historical durations are accurate, but a single slow test or a stalling sandbox can leave one batch on the critical path while other workers sit idle. With `impatiently_requeue_batches = true` (the default), the scheduler re-queues every batch the moment a worker pops it: multi-test batches are split in half and pushed back; single-test batches are re-queued with a counter, up to 3 additional times. The original worker keeps running the batch, while any idle worker can claim a duplicate; the first to finish wins, and the spawn loop's `is_decided` check skips batches whose tests have already completed.
+
+Set `impatiently_requeue_batches = false` to disable hedging — each LPT batch then runs exactly once on the sandbox that pops it. Consider this when:
+
+- duplicated work is expensive (e.g. per-execution billing on the provider, or tests with non-idempotent side effects);
+- batch runtimes are tightly predictable and you trust the LPT distribution;
+- worker count is very small, so a duplicate would crowd out queued work more than it would shorten the tail.
 
 ### `[provider]` -- Execution Provider
 
