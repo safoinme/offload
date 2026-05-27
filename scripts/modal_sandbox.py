@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11,<3.12"
 # dependencies = [
-#     "modal==1.4.1",
+#     "modal==1.4.3",
 #     "click>=8.0",
 #     "dockerfile-parse>=2.0.0",
 # ]
